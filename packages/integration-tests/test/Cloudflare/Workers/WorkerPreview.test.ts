@@ -23,6 +23,19 @@ const linearConfig = {
 };
 const envMarker = "team-fin|state-1|state-2|P-256";
 
+const counterScript = (marker: string) => `import { DurableObject } from "cloudflare:workers";
+export class Counter extends DurableObject {
+  async set() { await this.ctx.storage.put("value", "persisted-value"); }
+  async get() { return (await this.ctx.storage.get("value")) ?? "empty"; }
+}
+export default {
+  async fetch(request, env) {
+    const stub = env.Counter.getByName("shared");
+    if (new URL(request.url).pathname === "/set") await stub.set();
+    return new Response("${marker}:" + (await stub.get()));
+  },
+};`;
+
 const ECDSA_P256_JWK = {
   kty: "EC",
   crv: "P-256",
@@ -148,6 +161,80 @@ describe.concurrent(
           });
 
           yield* stack.destroy();
+        }).pipe(logLevel),
+      { timeout: 240_000 },
+    );
+
+    test.provider(
+      "adopts a Preview made outside Alchemy that already hosts a Durable Object",
+      (stack) =>
+        Effect.gen(function* () {
+          yield* stack.destroy();
+
+          const { accountId } = yield* yield* CloudflareEnvironment;
+          const previewName = "adopted";
+          const deployParent = Cloudflare.Worker("AdoptParent", {
+            script: script("adopt-parent"),
+          });
+          const parent = yield* stack.deploy(deployParent);
+
+          // Create the Preview the way `wrangler preview` does: outside
+          // Alchemy's state, with a migration tag and a hosted class.
+          const existing = yield* workers.createPreview({
+            accountId,
+            workerId: parent.workerName,
+            name: previewName,
+            ignoreBaseConfig: true,
+          });
+          yield* workers.createPreviewDeployment({
+            accountId,
+            workerId: parent.workerName,
+            previewId: existing.id,
+            metadata: {
+              mainModule: "main.js",
+              compatibilityDate: "2026-08-31",
+              migrations: { new_tag: "v1", new_sqlite_classes: ["Counter"] },
+              env: { Counter: { type: "durable_object_namespace", class_name: "Counter" } },
+            },
+            files: [
+              new File([counterScript("outside")], "main.js", {
+                type: "application/javascript+module",
+              }),
+            ],
+          });
+          const { subdomain } = yield* workers.getSubdomain({ accountId });
+          const url = `https://${existing.slug}-${parent.workerName}.${subdomain}.workers.dev`;
+          yield* expectUrlContains(`${url}/set`, "outside:persisted-value", {
+            label: "outside Preview writes Durable Object state",
+          });
+
+          const adopted = yield* stack.deploy(
+            Effect.gen(function* () {
+              const parent = yield* deployParent;
+              return yield* Cloudflare.Worker("AdoptPreview", {
+                script: counterScript("alchemy"),
+                env: { Counter: Cloudflare.DurableObject("Counter") },
+                preview: { of: parent, name: previewName },
+              });
+            }),
+          );
+
+          expect(adopted.previewId).toEqual(existing.id);
+          expect(adopted.previewDoClasses).toEqual(["Counter"]);
+          yield* expectUrlContains(adopted.url!, "alchemy:persisted-value", {
+            label: "adopted Preview keeps its Durable Object state",
+          });
+
+          yield* stack.destroy();
+
+          const gone = yield* workers
+            .getPreview({ accountId, workerId: parent.workerName, previewId: existing.id })
+            .pipe(
+              Effect.map(() => false),
+              Effect.catchTag("PreviewNotFound", () => Effect.succeed(true)),
+              Effect.catchTag("WorkerNotFound", () => Effect.succeed(true)),
+            );
+          expect(gone).toBe(true);
         }).pipe(logLevel),
       { timeout: 240_000 },
     );
