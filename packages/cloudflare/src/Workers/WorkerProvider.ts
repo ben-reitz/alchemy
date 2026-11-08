@@ -3166,7 +3166,10 @@ export const LiveWorkerProvider = () =>
               ),
             );
           const oldTag = latest?.migrationTag ?? undefined;
-          const previous = output?.previewDoClasses ?? [];
+          // Without state (e.g. adopting a Preview made outside Alchemy), assume
+          // the declared classes are already hosted: Cloudflare rejects
+          // new_sqlite_classes for a class with objects, and a new class fails loudly.
+          const previous = output?.previewDoClasses ?? classNames;
           if (oldTag === undefined) {
             migrations = { new_tag: "alchemy:v1", new_sqlite_classes: classNames };
           } else {
